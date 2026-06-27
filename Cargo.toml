@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["crates/tuxedoio", "prober", "daemon", "tui", "gui"]
+
+[workspace.package]
+license = "MIT"
+edition = "2021"

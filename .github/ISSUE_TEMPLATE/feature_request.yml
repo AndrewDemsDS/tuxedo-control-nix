@@ -1,0 +1,25 @@
+name: Feature request
+description: Propose a feature, an option, or support for a new board.
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For new board support, include your machine details below. Adding a board
+        follows a source-first process. See CONTRIBUTING.md.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+    validations: { required: true }
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations: { required: true }
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware (for board-support requests)
+      description: Model, board, SoC, tuxedo_io version, kernel, and `lsmod | grep -E 'uniwill|clevo'`. Can you test on real hardware?

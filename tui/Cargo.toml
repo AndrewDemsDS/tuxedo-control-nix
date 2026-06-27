@@ -1,0 +1,14 @@
+[package]
+name = "tuxedo-tui"
+version = "0.1.0"
+edition = "2021"
+description = "Live TUI dashboard for TUXEDO Uniwill: temps, fan duty, perf profile"
+license = "MIT"
+
+[[bin]]
+name = "tuxedo-tui"
+path = "src/main.rs"
+
+[dependencies]
+tuxedoio = { path = "../crates/tuxedoio" }
+crossterm = "0.28"
