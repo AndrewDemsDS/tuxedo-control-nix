@@ -99,7 +99,12 @@ services.tuxedo-control = {
 
 ## Roadmap (next)
 
-- Generalise beyond Uniwill-AMD Gen9 (model gating via `R_UW_MODEL_ID`).
+The initial roadmap (phases 0–6, declarative module options, a NixOS VM test, and model
+gating via `R_UW_MODEL_ID`) is complete. Model gating now refuses fan/EC writes on any board
+not in the known-models registry, so the daemon is safe to run on other Uniwill boards
+(read-only until validated). Future direction is breadth: validating and adding more boards
+to the registry — see [docs/model-gating.md](docs/model-gating.md) and
+[CONTRIBUTING](CONTRIBUTING.md#adding-support-for-a-new-board).
 
 ## Methodology (source-first, no black-box guessing)
 
