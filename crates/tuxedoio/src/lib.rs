@@ -57,6 +57,38 @@ pub const FAN_MAX: i32 = 0xc8;
 /// Bit in EC RAM 0x0751: when SET, `uw_set_fan` is a no-op and the EC owns the fan.
 pub const FAN_OWNERSHIP_BIT: i32 = 0x40;
 
+/// A board validated on real hardware: its model id and fan-duty raw max. Only boards that
+/// have been exercised with the prober belong here; the daemon refuses fan/EC writes on any
+/// model id not listed (read-only mode). See docs/model-gating.md.
+pub struct KnownModel {
+    pub model_id: i32,
+    pub name: &'static str,
+    pub fan_max: i32,
+}
+
+/// Registry of validated boards. `fan_max` is tied to `FAN_MAX` because the scaling helpers
+/// (`pct_to_raw`/`raw_to_pct`) use that constant; a board with a different raw max must not
+/// be added here until the scaling is made per-model.
+pub const KNOWN_MODELS: &[KnownModel] = &[KnownModel {
+    model_id: 0x1a,
+    name: "InfinityBook Pro AMD Gen9 (GXxHRXx)",
+    fan_max: FAN_MAX,
+}];
+
+/// Look up a validated board by model id; `None` means unsupported (run read-only).
+pub fn known_model(model_id: i32) -> Option<&'static KnownModel> {
+    KNOWN_MODELS.iter().find(|m| m.model_id == model_id)
+}
+
+/// Model id + capability probes read from the EC (see docs/model-gating.md).
+#[derive(Clone, Copy, Debug)]
+pub struct Caps {
+    pub model_id: i32,
+    pub fans_off: bool,
+    pub fans_min_speed: i32,
+    pub profs_available: i32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PerfProfile {
     PowerSave = 1,
@@ -90,35 +122,74 @@ pub fn raw_to_pct(r: i32) -> i32 {
     (r * 100 + FAN_MAX / 2) / FAN_MAX
 }
 
-pub struct TuxedoIo(std::fs::File);
+pub struct TuxedoIo {
+    file: std::fs::File,
+    /// Writes (fan duty, perf, mode, fan-auto) are refused unless the board is validated.
+    /// This is the safety gate: every EC-writing consumer (daemon, TUI) inherits it.
+    write_allowed: bool,
+}
 
 impl TuxedoIo {
+    /// Open with the model gate: reads are always allowed, but writes are refused on a board
+    /// whose model id is not in [`KNOWN_MODELS`] (an unvalidated board's fan scaling/ownership
+    /// behaviour is unknown). Use [`TuxedoIo::open_unchecked`] for the prober, which must be
+    /// able to write in order to validate a new board.
     pub fn open() -> io::Result<Self> {
-        Ok(Self(
-            OpenOptions::new()
+        let mut me = Self::open_unchecked()?;
+        // Best-effort: if the model id can't be read, stay locked (fail safe to read-only).
+        me.write_allowed = me
+            .model_id()
+            .map(|id| known_model(id).is_some())
+            .unwrap_or(false);
+        Ok(me)
+    }
+
+    /// Open WITHOUT the model write-gate. Reserved for the prober's source-first validation
+    /// of a new board (reads first, then writes with `auto` as the bail-out).
+    pub fn open_unchecked() -> io::Result<Self> {
+        Ok(Self {
+            file: OpenOptions::new()
                 .read(true)
                 .write(true)
                 .open("/dev/tuxedo_io")?,
-        ))
+            write_allowed: true,
+        })
+    }
+
+    /// Whether EC writes are permitted (i.e. the board is in [`KNOWN_MODELS`]).
+    pub fn write_allowed(&self) -> bool {
+        self.write_allowed
     }
 
     pub fn rd(&self, req: libc::c_ulong) -> io::Result<i32> {
         let mut v: i32 = 0;
-        let r = unsafe { libc::ioctl(self.0.as_raw_fd(), req, &mut v as *mut i32) };
+        let r = unsafe { libc::ioctl(self.file.as_raw_fd(), req, &mut v as *mut i32) };
         if r < 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(v)
     }
     pub fn wr(&self, req: libc::c_ulong, mut v: i32) -> io::Result<()> {
-        let r = unsafe { libc::ioctl(self.0.as_raw_fd(), req, &mut v as *mut i32) };
+        if !self.write_allowed {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "EC writes disabled: unvalidated board model",
+            ));
+        }
+        let r = unsafe { libc::ioctl(self.file.as_raw_fd(), req, &mut v as *mut i32) };
         if r < 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
     }
     pub fn noarg(&self, req: libc::c_ulong) -> io::Result<()> {
-        let r = unsafe { libc::ioctl(self.0.as_raw_fd(), req) };
+        if !self.write_allowed {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "EC writes disabled: unvalidated board model",
+            ));
+        }
+        let r = unsafe { libc::ioctl(self.file.as_raw_fd(), req) };
         if r < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -142,6 +213,34 @@ impl TuxedoIo {
     }
     pub fn mode(&self) -> io::Result<i32> {
         self.rd(R_UW_MODE)
+    }
+
+    /// Board model id (EC RAM 0x0740 via R_UW_MODEL_ID). Used to gate behaviour to
+    /// validated boards; see docs/model-gating.md.
+    pub fn model_id(&self) -> io::Result<i32> {
+        self.rd(R_UW_MODEL_ID)
+    }
+    /// Whether the EC allows the fan to stop (0%). Uniform `true` on the current driver.
+    pub fn fans_off_available(&self) -> io::Result<bool> {
+        Ok(self.rd(R_UW_FANS_OFF_AVAILABLE)? != 0)
+    }
+    /// On-speed floor in percent reported by the EC (driver default 25). The control loop
+    /// can honour this instead of a hardcoded floor.
+    pub fn fans_min_speed(&self) -> io::Result<i32> {
+        self.rd(R_UW_FANS_MIN_SPEED)
+    }
+    /// Number of performance profiles the board exposes (0, 2, or 3); model-gated.
+    pub fn profs_available(&self) -> io::Result<i32> {
+        self.rd(R_UW_PROFS_AVAILABLE)
+    }
+    /// Read model id + capability probes together.
+    pub fn caps(&self) -> io::Result<Caps> {
+        Ok(Caps {
+            model_id: self.model_id()?,
+            fans_off: self.fans_off_available()?,
+            fans_min_speed: self.fans_min_speed()?,
+            profs_available: self.profs_available()?,
+        })
     }
 
     /// Clear bit 0x40 of 0x0751 so manual fan writes are honoured. Returns true if it
@@ -174,7 +273,7 @@ impl TuxedoIo {
 
     pub fn version(&self) -> io::Result<String> {
         let mut buf = [0u8; 64];
-        let r = unsafe { libc::ioctl(self.0.as_raw_fd(), R_MOD_VERSION, buf.as_mut_ptr()) };
+        let r = unsafe { libc::ioctl(self.file.as_raw_fd(), R_MOD_VERSION, buf.as_mut_ptr()) };
         if r < 0 {
             return Err(io::Error::last_os_error());
         }

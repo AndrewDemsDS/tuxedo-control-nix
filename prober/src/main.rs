@@ -63,7 +63,9 @@ fn usage() {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let d = match TuxedoIo::open() {
+    // The prober is the source-first validation tool for new boards, so it bypasses the
+    // model write-gate (reads first, then writes with `auto` as the bail-out).
+    let d = match TuxedoIo::open_unchecked() {
         Ok(d) => d,
         Err(e) => {
             eprintln!("open /dev/tuxedo_io: {e} (run as root?)");

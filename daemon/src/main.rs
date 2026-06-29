@@ -26,9 +26,14 @@ const SOCK_PATH: &str = "/run/tuxedo-control.sock";
 /// Apply a profile's perf mode + (optional) keyboard backlight + charge profile.
 /// The control loop reads the fan curve live from the active profile.
 fn apply_profile(dev: &Arc<Mutex<TuxedoIo>>, shared: &Arc<Mutex<Shared>>, p: &Profile) {
-    if let Some(pp) = PerfProfile::from_name(&p.perf) {
-        let _ = dev.lock().unwrap().set_perf(pp);
-        shared.lock().unwrap().profile = pp.as_id().into();
+    // On an unsupported board we never write to the EC (perf lives in the same 0x0751
+    // register as fan ownership). Keyboard backlight / charging are sysfs and stay allowed.
+    let read_only = shared.lock().unwrap().read_only;
+    if !read_only {
+        if let Some(pp) = PerfProfile::from_name(&p.perf) {
+            let _ = dev.lock().unwrap().set_perf(pp);
+            shared.lock().unwrap().profile = pp.as_id().into();
+        }
     }
     if let Some(b) = p.kbd {
         let dir = shared.lock().unwrap().kbd_dir.clone();
@@ -109,6 +114,8 @@ struct Shared {
     kbd_cur: i32,
     charge: String,
     charges: String, // current + space-separated available
+    model_id: i32,
+    read_only: bool, // unsupported model: no fan/EC writes, status only
 }
 
 // ---- Keyboard backlight (sysfs led) ----
@@ -221,10 +228,14 @@ fn handle_client(
         Some("STATUS") => {
             // Read ONLY the cache the loop maintains: instant, no device/EC access, no contention.
             let s = shared.lock().unwrap();
-            format!("{{\"cpu_temp\":{},\"gpu_temp\":{},\"cpu_fan\":{},\"gpu_fan\":{},\"mode\":{},\"curve_pct\":{},\"manual\":{},\"profile\":\"{}\",\"kbd\":{},\"kbd_max\":{},\"charge\":\"{}\",\"charges\":\"{}\"}}",
+            format!("{{\"cpu_temp\":{},\"gpu_temp\":{},\"cpu_fan\":{},\"gpu_fan\":{},\"mode\":{},\"curve_pct\":{},\"manual\":{},\"profile\":\"{}\",\"kbd\":{},\"kbd_max\":{},\"charge\":\"{}\",\"charges\":\"{}\",\"model_id\":{},\"read_only\":{}}}",
                 s.cpu_temp, s.gpu_temp, s.cpu_fan, s.gpu_fan, s.mode, s.curve_pct,
                 s.manual.map(|m| m.to_string()).unwrap_or_else(|| "null".into()), s.profile, s.kbd_cur, s.kbd_max,
-                s.charge, s.charges)
+                s.charge, s.charges, s.model_id, s.read_only)
+        }
+        // Reject EC writes on unsupported boards (perf shares the 0x0751 register with fan).
+        Some("PROFILE") if shared.lock().unwrap().read_only => {
+            "ERR read-only (unsupported model)".into()
         }
         Some("PROFILE") => match parts.next().and_then(PerfProfile::from_name) {
             // Serialise EC access through the one device handle (concurrent ioctls corrupt reads).
@@ -337,6 +348,9 @@ fn handle_client(
             shared.lock().unwrap().manual = None;
             "OK".into()
         }
+        Some("FANMANUAL") if shared.lock().unwrap().read_only => {
+            "ERR read-only (unsupported model)".into()
+        }
         Some("FANMANUAL") => match parts.next().and_then(|s| s.parse::<i32>().ok()) {
             Some(p) => {
                 shared.lock().unwrap().manual = Some(p.clamp(0, 100));
@@ -360,21 +374,53 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let model_id;
+    let read_only;
     {
         let d = dev.lock().unwrap();
         if !d.is_uniwill().unwrap_or(false) {
             eprintln!("not Uniwill, refusing");
             std::process::exit(1);
         }
+        // The library gate (set in TuxedoIo::open from the model id) is the source of truth:
+        // an unvalidated board refuses EC writes, so we run READ-ONLY (status only). Reading
+        // model id here is just for logging/STATUS and is independent of the gate, so a failed
+        // capability probe can never demote a validated board.
+        model_id = d.model_id().unwrap_or(0);
+        read_only = !d.write_allowed();
+        if read_only {
+            eprintln!(
+                "tuxedo-controld: tuxedo_io {}, model {model_id:#x} UNSUPPORTED -> READ-ONLY \
+                 (no fan/EC writes). Validate with the prober and add it to KNOWN_MODELS; \
+                 see docs/model-gating.md.",
+                d.version().unwrap_or_default()
+            );
+        } else {
+            eprintln!(
+                "tuxedo-controld: tuxedo_io {}, model {model_id:#x} ({}), poll {}s, hyst {}C",
+                d.version().unwrap_or_default(),
+                tuxedoio::known_model(model_id)
+                    .map(|m| m.name)
+                    .unwrap_or("validated"),
+                cfg.poll_seconds,
+                cfg.hysteresis_c
+            );
+        }
+        // Best-effort capability log (must not affect gating).
         eprintln!(
-            "tuxedo-controld: tuxedo_io {}, poll {}s, hyst {}C",
-            d.version().unwrap_or_default(),
-            cfg.poll_seconds,
-            cfg.hysteresis_c
+            "caps: fans_off={} min_speed={}% profs_avail={}",
+            d.fans_off_available().unwrap_or(false),
+            d.fans_min_speed().unwrap_or(25),
+            d.profs_available().unwrap_or(0)
         );
     }
 
     let shared = Arc::new(Mutex::new(Shared::default()));
+    {
+        let mut s = shared.lock().unwrap();
+        s.model_id = model_id;
+        s.read_only = read_only;
+    }
     // Discover keyboard backlight + charging support first (apply_profile uses them).
     if let Some(dir) = kbd_find() {
         let max = kbd_read(&dir, "max_brightness");
@@ -508,7 +554,8 @@ fn main() {
             let target = manual
                 .unwrap_or(curve_target)
                 .max(profiles::safety_floor(temp));
-            if d.set_fan_pct(target).is_ok() && target != commanded {
+            // Read-only on unsupported boards: report the curve target but never drive the EC.
+            if !read_only && d.set_fan_pct(target).is_ok() && target != commanded {
                 eprintln!(
                     "temp {temp}C -> fan {target}%{}",
                     if manual.is_some() { " (manual)" } else { "" }
@@ -546,8 +593,13 @@ fn main() {
         std::thread::sleep(Duration::from_secs(cfg.poll_seconds));
     }
 
-    eprintln!("shutting down, restoring EC auto fan");
-    let _ = dev.lock().unwrap().restore_auto();
+    // Only hand the fan back to the EC if we ever took it (read-only never touched it).
+    if !read_only {
+        eprintln!("shutting down, restoring EC auto fan");
+        let _ = dev.lock().unwrap().restore_auto();
+    } else {
+        eprintln!("shutting down (read-only; EC fan untouched)");
+    }
     let _ = std::fs::remove_file(SOCK_PATH);
 }
 

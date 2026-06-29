@@ -9,6 +9,13 @@ may change in any `0.y` release. See "Versioning" in the README.
 
 ## [Unreleased]
 
+### Added
+- Model gating via `R_UW_MODEL_ID` (generalise safely beyond the Gen9 reference board). The
+  `tuxedoio` library refuses EC writes on any board whose model id is not in a known-models
+  registry (`TuxedoIo::open`), so an unvalidated board runs read-only; the prober uses
+  `TuxedoIo::open_unchecked` to validate new boards. The daemon logs the gating decision and
+  surfaces `model_id` + `read_only` in its `STATUS` reply. See `docs/model-gating.md`.
+
 ## [0.2.0] - 2026-06-29
 
 ### Added
