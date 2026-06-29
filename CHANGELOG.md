@@ -9,6 +9,8 @@ may change in any `0.y` release. See "Versioning" in the README.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-29
+
 ### Added
 - Module options `keyboard.backlight.brightness` and `charging.profile`, re-asserted by
   the daemon on every start (declarative keyboard backlight and battery charging profile).
@@ -49,5 +51,6 @@ may change in any `0.y` release. See "Versioning" in the README.
   `tuxedo_io` v0.3.9). Other boards are unverified. See "Supported hardware".
 - The driver enforces a ~25% on-speed floor; a requested duty below ~12% becomes 0 (off).
 
-[Unreleased]: https://github.com/AndrewDemsDS/tuxedo-control-nix/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/AndrewDemsDS/tuxedo-control-nix/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/AndrewDemsDS/tuxedo-control-nix/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/AndrewDemsDS/tuxedo-control-nix/releases/tag/v0.1.0
