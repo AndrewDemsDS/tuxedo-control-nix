@@ -16,6 +16,10 @@ may change in any `0.y` release. See "Versioning" in the README.
   wiring, that tuxedo-rs/tailord is disabled, that the declarative options reach the daemon
   config, and that the daemon fails gracefully without hardware. Runs in GitHub CI.
 
+### Changed
+- GUI fan-curve editor now labels both axes: temperature in °C and fan duty in %, with
+  per-tick units and "Temperature (°C)" / "Fan duty (%)" axis titles.
+
 ## [0.1.0] - 2026-06-27
 
 ### Added

@@ -10,7 +10,7 @@ use gtk::cairo;
 
 const T_MAX: f64 = 100.0; // temperature axis °C
 const D_MAX: f64 = 100.0; // duty axis %
-const PAD: f64 = 44.0; // plot padding (room for the °C / % axis labels)
+const PAD: f64 = 64.0; // plot padding (room for the °C / % tick labels + axis titles)
 const HIT: f64 = 14.0; // px radius to grab/remove a point
 
 type Curve = Rc<RefCell<Vec<(i32, i32)>>>;
@@ -170,6 +170,23 @@ pub fn open(
                     cr.move_to(PAD - 8.0 - ext.width(), gy + ext.height() / 2.0);
                     let _ = cr.show_text(&ylabel);
                 }
+            }
+            // Axis titles (named axis + unit), slightly stronger than the tick labels.
+            cr.set_source_rgba(col.red() as f64, col.green() as f64, col.blue() as f64, 0.9);
+            cr.set_font_size(12.0);
+            let xtitle = "Temperature (°C)";
+            if let Ok(ext) = cr.text_extents(xtitle) {
+                cr.move_to(w / 2.0 - ext.width() / 2.0, h - 10.0);
+                let _ = cr.show_text(xtitle);
+            }
+            let ytitle = "Fan duty (%)";
+            if let Ok(ext) = cr.text_extents(ytitle) {
+                // Rotate -90° so the title runs up the left edge, centred on the plot height.
+                let _ = cr.save();
+                cr.move_to(18.0, h / 2.0 + ext.width() / 2.0);
+                cr.rotate(-std::f64::consts::FRAC_PI_2);
+                let _ = cr.show_text(ytitle);
+                let _ = cr.restore();
             }
         });
     }
