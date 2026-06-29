@@ -119,8 +119,13 @@ struct Shared {
 }
 
 // ---- Keyboard backlight (sysfs led) ----
+/// The leds class dir. Overridable via `TUXEDO_LEDS_DIR` so tests can point it at a tempdir;
+/// production always uses `/sys/class/leds`.
+fn leds_dir() -> String {
+    std::env::var("TUXEDO_LEDS_DIR").unwrap_or_else(|_| "/sys/class/leds".to_string())
+}
 fn kbd_find() -> Option<String> {
-    let dir = std::fs::read_dir("/sys/class/leds").ok()?;
+    let dir = std::fs::read_dir(leds_dir()).ok()?;
     for e in dir.flatten() {
         let name = e.file_name();
         if name.to_string_lossy().contains("kbd_backlight") {
@@ -694,30 +699,106 @@ mod tests {
         assert_eq!(profiles::safety_floor(95), 80);
     }
 
-    // ---- charge profile sysfs ----
-    // ALL charge file-IO lives in this ONE test: chg_dir() reads TUXEDO_CHG_DIR, which is
-    // process-global, and cargo runs tests in parallel threads. A second test touching the
-    // env var would race this one.
+    // ---- per-model sysfs matrix: charging profile + keyboard backlight ----
+    // Charge and keyboard backlight are sysfs, not tuxedo_io. This iterates the shared
+    // `tuxedoio::sim::MODELS` fixtures and, per model, builds a simulated sysfs tree, points the
+    // daemon's helpers at it (TUXEDO_CHG_DIR / TUXEDO_LEDS_DIR), and asserts what our code
+    // actually enforces: charging presence-gating + enum validation, and keyboard discovery +
+    // per-model max_brightness. Both env vars are process-global and cargo runs tests in
+    // parallel threads, so this is the SOLE test that uses them — no other test races it.
     #[test]
-    fn charge_set_get_present() {
-        let dir = std::env::temp_dir().join(format!("tuxedo-test-chg-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("TUXEDO_CHG_DIR", &dir);
+    fn sysfs_model_matrix() {
+        use tuxedoio::sim::{KbdBacklight, MODELS};
+        let root = std::env::temp_dir().join(format!("tuxedo-sysfs-matrix-{}", std::process::id()));
 
-        // Validation rejects unknown profiles BEFORE any file write.
-        let err = chg_set("garbage").unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        for (i, m) in MODELS.iter().enumerate() {
+            let base = root.join(format!("m{i}-{:#x}", m.model_id));
+            let chg = base.join("charging");
+            let leds = base.join("leds");
+            std::fs::create_dir_all(&leds).unwrap();
 
-        // A valid profile writes {dir}/charging_profile and round-trips.
-        chg_set("stationary").unwrap();
-        assert_eq!(chg_get(), "stationary");
-        assert!(chg_present());
+            // --- charging: the attribute dir exists only if the board supports it ---
+            if m.charging {
+                std::fs::create_dir_all(&chg).unwrap();
+                std::fs::write(chg.join("charging_profile"), "balanced").unwrap();
+                std::fs::write(
+                    chg.join("charging_profiles_available"),
+                    "high_capacity balanced stationary\n",
+                )
+                .unwrap();
+                std::env::set_var("TUXEDO_CHG_DIR", &chg);
+            } else {
+                // A path that does not exist -> chg_present() is false (daemon skips charge).
+                std::env::set_var("TUXEDO_CHG_DIR", base.join("no-charging"));
+            }
 
-        chg_set("balanced").unwrap();
-        assert_eq!(chg_get(), "balanced");
+            assert_eq!(chg_present(), m.charging, "{}: chg_present", m.name);
+            if m.charging {
+                // Enum enforced (bad value rejected before any write); valid values round-trip.
+                assert_eq!(
+                    chg_set("garbage").unwrap_err().kind(),
+                    std::io::ErrorKind::InvalidInput,
+                    "{}: enum validation",
+                    m.name
+                );
+                chg_set("stationary").unwrap();
+                assert_eq!(chg_get(), "stationary", "{}: round-trip", m.name);
+                chg_set("high_capacity").unwrap();
+                assert_eq!(chg_get(), "high_capacity", "{}: round-trip", m.name);
+                assert!(chg_avail().contains("balanced"), "{}: avail", m.name);
+            }
+
+            // --- keyboard backlight: led dir present only if the board has a backlight ---
+            if m.kbd_max_brightness > 0 {
+                let name = match m.kbd {
+                    KbdBacklight::White => "white:kbd_backlight",
+                    _ => "rgb:kbd_backlight",
+                };
+                let led = leds.join(name);
+                std::fs::create_dir_all(&led).unwrap();
+                std::fs::write(led.join("max_brightness"), m.kbd_max_brightness.to_string())
+                    .unwrap();
+                std::fs::write(led.join("brightness"), "0").unwrap();
+            }
+            std::env::set_var("TUXEDO_LEDS_DIR", &leds);
+
+            match kbd_find() {
+                Some(dir) => {
+                    assert!(
+                        m.kbd_max_brightness > 0,
+                        "{}: found a backlight but fixture has none",
+                        m.name
+                    );
+                    assert_eq!(
+                        kbd_read(&dir, "max_brightness"),
+                        m.kbd_max_brightness,
+                        "{}: max_brightness",
+                        m.name
+                    );
+                    // Brightness write/read round-trips; our code writes raw (kernel clamps).
+                    kbd_write(&dir, m.kbd_max_brightness).unwrap();
+                    assert_eq!(
+                        kbd_read(&dir, "brightness"),
+                        m.kbd_max_brightness,
+                        "{}: brightness round-trip",
+                        m.name
+                    );
+                    // Negative clamps to 0 in our code.
+                    kbd_write(&dir, -3).unwrap();
+                    assert_eq!(
+                        kbd_read(&dir, "brightness"),
+                        0,
+                        "{}: negative clamp",
+                        m.name
+                    );
+                }
+                None => assert_eq!(m.kbd_max_brightness, 0, "{}: expected no backlight", m.name),
+            }
+        }
 
         std::env::remove_var("TUXEDO_CHG_DIR");
-        let _ = std::fs::remove_dir_all(&dir);
+        std::env::remove_var("TUXEDO_LEDS_DIR");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ---- keyboard backlight sysfs (dir param: no env, no races) ----

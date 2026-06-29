@@ -18,8 +18,10 @@ may change in any `0.y` release. See "Versioning" in the README.
 - Simulated `tuxedo_io` EC test harness (`tuxedoio::sim`) with a per-model fixture table, plus a
   model-matrix test suite run in CI (`cargo test --workspace`). For each board it verifies the
   write-gate (only validated models are writable), fan-duty scaling, the `0x40` fan-ownership
-  fix, performance-profile enforcement, and capability probes — with daemon unit tests for the
-  fan-curve interpolation, safety floor, charging-profile, and keyboard-backlight logic.
+  fix, performance-profile enforcement, and capability probes. A companion per-model **sysfs**
+  matrix in the daemon (driven by the same fixtures) simulates `/sys` to check charging-profile
+  presence-gating + enum validation and keyboard-backlight discovery + per-model
+  `max_brightness`; plus unit tests for fan-curve interpolation and the safety floor.
 
 ## [0.2.0] - 2026-06-29
 

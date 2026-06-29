@@ -43,6 +43,9 @@ pub struct ModelFixture {
     pub profs_available: i32,
     pub charging: bool,
     pub kbd: KbdBacklight,
+    /// `max_brightness` the keyboard-backlight LED exposes (0 = no backlight). Real driver
+    /// values: white-only `2`, 5-level white / 1-zone RGB `4`, Clevo `255` (per `*_leds.h`).
+    pub kbd_max_brightness: i32,
 }
 
 impl ModelFixture {
@@ -68,6 +71,7 @@ pub const MODELS: &[ModelFixture] = &[
         profs_available: 3,
         charging: true,
         kbd: KbdBacklight::White,
+        kbd_max_brightness: 4, // 5-level white (0..4, matches the GUI scale)
     },
     ModelFixture {
         model_id: 0x09,
@@ -79,6 +83,7 @@ pub const MODELS: &[ModelFixture] = &[
         profs_available: 2,
         charging: false, // PF5xx is excluded from charging-profile support
         kbd: KbdBacklight::OneZoneRgb,
+        kbd_max_brightness: 4,
     },
     ModelFixture {
         model_id: 0x12,
@@ -90,6 +95,7 @@ pub const MODELS: &[ModelFixture] = &[
         profs_available: 3,
         charging: true,
         kbd: KbdBacklight::White,
+        kbd_max_brightness: 2,
     },
     ModelFixture {
         model_id: 0x13,
@@ -101,6 +107,7 @@ pub const MODELS: &[ModelFixture] = &[
         profs_available: 3,
         charging: true,
         kbd: KbdBacklight::White,
+        kbd_max_brightness: 2,
     },
     ModelFixture {
         model_id: 0x14,
@@ -112,6 +119,7 @@ pub const MODELS: &[ModelFixture] = &[
         profs_available: 3,
         charging: true,
         kbd: KbdBacklight::White,
+        kbd_max_brightness: 2,
     },
     ModelFixture {
         model_id: 0x17,
@@ -123,6 +131,7 @@ pub const MODELS: &[ModelFixture] = &[
         profs_available: 3,
         charging: true,
         kbd: KbdBacklight::PerKeyRgb,
+        kbd_max_brightness: 4,
     },
     ModelFixture {
         model_id: 0x2a,
@@ -134,6 +143,7 @@ pub const MODELS: &[ModelFixture] = &[
         profs_available: 2,
         charging: false,
         kbd: KbdBacklight::OneZoneRgb,
+        kbd_max_brightness: 4,
     },
     ModelFixture {
         model_id: 0x2b,
@@ -145,6 +155,7 @@ pub const MODELS: &[ModelFixture] = &[
         profs_available: 0,
         charging: true,
         kbd: KbdBacklight::None,
+        kbd_max_brightness: 0, // no keyboard backlight
     },
     ModelFixture {
         model_id: 0x00,
@@ -156,6 +167,7 @@ pub const MODELS: &[ModelFixture] = &[
         profs_available: 0,
         charging: false,
         kbd: KbdBacklight::PerKeyRgb,
+        kbd_max_brightness: 255, // Clevo CLEVO_KBD_BRIGHTNESS_MAX = 0xff
     },
 ];
 
