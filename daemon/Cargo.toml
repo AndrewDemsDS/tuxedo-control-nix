@@ -1,0 +1,16 @@
+[package]
+name = "tuxedo-control-daemon"
+version = "0.1.0"
+edition = "2021"
+description = "Fan-curve + performance daemon for TUXEDO Uniwill laptops via /dev/tuxedo_io"
+license = "MIT"
+
+[[bin]]
+name = "tuxedo-controld"
+path = "src/main.rs"
+
+[dependencies]
+tuxedoio = { path = "../crates/tuxedoio" }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

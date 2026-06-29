@@ -1,0 +1,41 @@
+name: CI
+
+# Self-hosted Gitea (act_runner, Docker executor, no Nix sandbox available), so we don't
+# run `nix build` here; eval + cargo build/clippy/test cover it. The full `nix build` runs
+# on GitHub Actions where the sandbox works.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  flake:
+    name: nix flake check (eval)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+      # --no-build: evaluate flake outputs + the NixOS module without sandbox-building
+      # derivations (the act_runner container can't sandbox).
+      - run: nix flake check --no-build
+
+  cargo:
+    name: fmt / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+      # nix develop substitutes the toolchain + GTK libs from the cache (no sandbox build),
+      # then cargo compiles the whole workspace. That is the real build verification.
+      - run: nix develop --command cargo fmt --all --check
+      - run: nix develop --command cargo clippy --workspace --all-targets -- -D warnings
+      - run: nix develop --command cargo test --workspace

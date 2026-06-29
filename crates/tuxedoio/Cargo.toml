@@ -1,0 +1,9 @@
+[package]
+name = "tuxedoio"
+version = "0.1.0"
+edition = "2021"
+description = "Safe-ish wrappers over the /dev/tuxedo_io Uniwill ioctl interface"
+license = "MIT"
+
+[dependencies]
+libc = "0.2"

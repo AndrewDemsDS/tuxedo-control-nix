@@ -1,0 +1,554 @@
+//! tuxedo-controld: fan-curve + performance daemon for TUXEDO Uniwill laptops.
+//!
+//! Owns the hardware (clears the 0x40 fan-ownership bit every tick so the EC can't steal the
+//! fan), runs a temp→duty curve, and exposes a tiny line protocol on a Unix socket so the GUI
+//! can read status and change profile / fan mode without touching the device or fighting us.
+//!
+//! Socket: /run/tuxedo-control.sock  (one request line -> one response line)
+//!   STATUS            -> JSON {cpu_temp,gpu_temp,cpu_fan,gpu_fan,profile,manual,mode,curve_pct}
+//!   PROFILE <name>    -> OK | ERR ...   (power_save|enthusiast|overboost)
+//!   FANAUTO           -> OK             (clear manual override -> resume curve)
+//!   FANMANUAL <0-100> -> OK             (hold a fixed duty)
+
+use serde::Deserialize;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tuxedoio::{PerfProfile, TuxedoIo};
+
+mod profiles;
+use profiles::{Profile, Store};
+
+const SOCK_PATH: &str = "/run/tuxedo-control.sock";
+
+/// Apply a profile's perf mode + (optional) keyboard backlight + charge profile.
+/// The control loop reads the fan curve live from the active profile.
+fn apply_profile(dev: &Arc<Mutex<TuxedoIo>>, shared: &Arc<Mutex<Shared>>, p: &Profile) {
+    if let Some(pp) = PerfProfile::from_name(&p.perf) {
+        let _ = dev.lock().unwrap().set_perf(pp);
+        shared.lock().unwrap().profile = pp.as_id().into();
+    }
+    if let Some(b) = p.kbd {
+        let dir = shared.lock().unwrap().kbd_dir.clone();
+        if let Some(d) = dir {
+            let _ = kbd_write(&d, b);
+            shared.lock().unwrap().kbd_cur = b;
+        }
+    }
+    if let Some(ref c) = p.charge {
+        if chg_present() && chg_set(c).is_ok() {
+            shared.lock().unwrap().charge = c.clone();
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct Config {
+    #[serde(default = "d_poll")]
+    poll_seconds: u64,
+    #[serde(default = "d_hyst")]
+    hysteresis_c: i32,
+    #[serde(default)]
+    profile: Option<String>, // built-in/profile name to activate at start
+    #[serde(default)]
+    perf_profile: Option<String>,
+    #[serde(default)]
+    kbd_brightness: Option<i32>,
+    #[serde(default)]
+    charge_profile: Option<String>,
+    #[serde(default = "d_curve")]
+    curve: Vec<(i32, i32)>,
+}
+fn d_poll() -> u64 {
+    2
+}
+fn d_hyst() -> i32 {
+    3
+}
+fn d_curve() -> Vec<(i32, i32)> {
+    vec![
+        (25, 0),
+        (50, 0),
+        (62, 24),
+        (68, 36),
+        (72, 44),
+        (80, 60),
+        (86, 72),
+        (90, 100),
+    ]
+}
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            poll_seconds: d_poll(),
+            hysteresis_c: d_hyst(),
+            profile: None,
+            perf_profile: None,
+            kbd_brightness: None,
+            charge_profile: None,
+            curve: d_curve(),
+        }
+    }
+}
+
+/// The control loop and socket server share this.
+#[derive(Default)]
+struct Shared {
+    cpu_temp: i32,
+    gpu_temp: i32,
+    cpu_fan: i32,
+    gpu_fan: i32,
+    mode: i32,
+    curve_pct: i32,      // what the curve asks for
+    manual: Option<i32>, // Some(pct) => hold a fixed duty; None => follow the curve
+    profile: String,
+    kbd_dir: Option<String>, // /sys/class/leds/<...kbd_backlight> if present
+    kbd_max: i32,
+    kbd_cur: i32,
+    charge: String,
+    charges: String, // current + space-separated available
+}
+
+// ---- Keyboard backlight (sysfs led) ----
+fn kbd_find() -> Option<String> {
+    let dir = std::fs::read_dir("/sys/class/leds").ok()?;
+    for e in dir.flatten() {
+        let name = e.file_name();
+        if name.to_string_lossy().contains("kbd_backlight") {
+            return Some(e.path().to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+fn kbd_read(dir: &str, attr: &str) -> i32 {
+    std::fs::read_to_string(format!("{dir}/{attr}"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(-1)
+}
+fn kbd_write(dir: &str, v: i32) -> std::io::Result<()> {
+    std::fs::write(format!("{dir}/brightness"), v.max(0).to_string())
+}
+
+// ---- Battery charging profile (sysfs; stationary / balanced / high_capacity) ----
+const CHG_DIR: &str = "/sys/devices/platform/tuxedo_keyboard/charging_profile";
+fn chg_present() -> bool {
+    std::path::Path::new(&format!("{CHG_DIR}/charging_profile")).exists()
+}
+fn chg_get() -> String {
+    std::fs::read_to_string(format!("{CHG_DIR}/charging_profile"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+fn chg_avail() -> String {
+    std::fs::read_to_string(format!("{CHG_DIR}/charging_profiles_available"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+fn chg_set(v: &str) -> std::io::Result<()> {
+    if !["high_capacity", "balanced", "stationary"].contains(&v) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "bad profile",
+        ));
+    }
+    std::fs::write(format!("{CHG_DIR}/charging_profile"), v)
+}
+
+fn interp(curve: &[(i32, i32)], temp: i32) -> i32 {
+    if curve.is_empty() {
+        return 0;
+    }
+    if temp <= curve[0].0 {
+        return curve[0].1;
+    }
+    if temp >= curve[curve.len() - 1].0 {
+        return curve[curve.len() - 1].1;
+    }
+    for w in curve.windows(2) {
+        let ((t0, d0), (t1, d1)) = (w[0], w[1]);
+        if temp >= t0 && temp <= t1 {
+            return if t1 == t0 {
+                d1
+            } else {
+                d0 + (d1 - d0) * (temp - t0) / (t1 - t0)
+            };
+        }
+    }
+    curve[curve.len() - 1].1
+}
+
+fn load_config() -> Config {
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/etc/tuxedo-control/config.json".into());
+    match std::fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
+            eprintln!("config parse {path}: {e}; defaults");
+            Config::default()
+        }),
+        Err(_) => {
+            eprintln!("no config at {path}; built-in quiet defaults");
+            Config::default()
+        }
+    }
+}
+
+fn handle_client(
+    stream: UnixStream,
+    dev: &Arc<Mutex<TuxedoIo>>,
+    shared: &Arc<Mutex<Shared>>,
+    store: &Arc<Mutex<Store>>,
+) {
+    let mut reader = BufReader::new(match stream.try_clone() {
+        Ok(s) => s,
+        Err(_) => return,
+    });
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() {
+        return;
+    }
+    let mut w = stream;
+    let mut parts = line.split_whitespace();
+    // The argument after the command word, for names that contain spaces.
+    let rest = line
+        .split_once(char::is_whitespace)
+        .map(|(_, r)| r.trim())
+        .unwrap_or("");
+    let resp: String = match parts.next() {
+        Some("STATUS") => {
+            // Read ONLY the cache the loop maintains: instant, no device/EC access, no contention.
+            let s = shared.lock().unwrap();
+            format!("{{\"cpu_temp\":{},\"gpu_temp\":{},\"cpu_fan\":{},\"gpu_fan\":{},\"mode\":{},\"curve_pct\":{},\"manual\":{},\"profile\":\"{}\",\"kbd\":{},\"kbd_max\":{},\"charge\":\"{}\",\"charges\":\"{}\"}}",
+                s.cpu_temp, s.gpu_temp, s.cpu_fan, s.gpu_fan, s.mode, s.curve_pct,
+                s.manual.map(|m| m.to_string()).unwrap_or_else(|| "null".into()), s.profile, s.kbd_cur, s.kbd_max,
+                s.charge, s.charges)
+        }
+        Some("PROFILE") => match parts.next().and_then(PerfProfile::from_name) {
+            // Serialise EC access through the one device handle (concurrent ioctls corrupt reads).
+            Some(p) => {
+                let _ = dev.lock().unwrap().set_perf(p);
+                shared.lock().unwrap().profile = p.as_id().into();
+                "OK".into()
+            }
+            None => "ERR bad profile".into(),
+        },
+        Some("KBDSET") => match parts.next().and_then(|s| s.parse::<i32>().ok()) {
+            Some(v) => {
+                let dir = shared.lock().unwrap().kbd_dir.clone();
+                match dir {
+                    Some(d) => {
+                        if kbd_write(&d, v).is_ok() {
+                            shared.lock().unwrap().kbd_cur = v;
+                            "OK".into()
+                        } else {
+                            "ERR write".into()
+                        }
+                    }
+                    None => "ERR no kbd backlight".into(),
+                }
+            }
+            None => "ERR bad value".into(),
+        },
+        Some("CHARGE") => match parts.next() {
+            Some(v) => {
+                if chg_set(v).is_ok() {
+                    shared.lock().unwrap().charge = v.to_string();
+                    "OK".into()
+                } else {
+                    "ERR charge set".into()
+                }
+            }
+            None => "ERR bad value".into(),
+        },
+        // ---- named profiles ----
+        Some("LISTPROFILES") => {
+            serde_json::to_string(&*store.lock().unwrap()).unwrap_or_else(|_| "ERR".into())
+        }
+        Some("ACTIVATE") if !rest.is_empty() => {
+            let prof = store.lock().unwrap().get(rest).cloned();
+            match prof {
+                Some(p) => {
+                    apply_profile(dev, shared, &p);
+                    let mut s = store.lock().unwrap();
+                    s.active = rest.to_string();
+                    let _ = profiles::save(&s);
+                    "OK".into()
+                }
+                None => "ERR no such profile".into(),
+            }
+        }
+        Some("SETDEFAULT") if !rest.is_empty() => {
+            let mut s = store.lock().unwrap();
+            if s.get(rest).is_some() {
+                s.default = rest.to_string();
+                let _ = profiles::save(&s);
+                "OK".into()
+            } else {
+                "ERR no such profile".into()
+            }
+        }
+        Some("DELPROFILE") if !rest.is_empty() => {
+            if profiles::is_builtin(rest) {
+                "ERR built-in profiles cannot be deleted".into()
+            } else {
+                let mut s = store.lock().unwrap();
+                s.profiles.retain(|p| p.name != rest);
+                if s.active == rest {
+                    s.active = s.default.clone();
+                }
+                let _ = profiles::save(&s);
+                "OK".into()
+            }
+        }
+        Some("SAVEPROFILE") => {
+            // rest of the line is a JSON Profile object
+            let json = rest;
+            match serde_json::from_str::<Profile>(json) {
+                Ok(p) => {
+                    let mut s = store.lock().unwrap();
+                    s.profiles.retain(|x| x.name != p.name);
+                    s.profiles.push(p);
+                    let _ = profiles::save(&s);
+                    "OK".into()
+                }
+                Err(e) => format!("ERR {e}"),
+            }
+        }
+        Some("IMPORTTCC") if !rest.is_empty() => match std::fs::read_to_string(rest) {
+            Ok(txt) => match profiles::import_tcc(&txt) {
+                Ok(imported) => {
+                    let n = imported.len();
+                    let mut s = store.lock().unwrap();
+                    for p in imported {
+                        s.profiles.retain(|x| x.name != p.name);
+                        s.profiles.push(p);
+                    }
+                    let _ = profiles::save(&s);
+                    format!("OK imported {n}")
+                }
+                Err(e) => format!("ERR {e}"),
+            },
+            Err(e) => format!("ERR read {e}"),
+        },
+        Some("FANAUTO") => {
+            shared.lock().unwrap().manual = None;
+            "OK".into()
+        }
+        Some("FANMANUAL") => match parts.next().and_then(|s| s.parse::<i32>().ok()) {
+            Some(p) => {
+                shared.lock().unwrap().manual = Some(p.clamp(0, 100));
+                "OK".into()
+            }
+            None => "ERR bad pct".into(),
+        },
+        _ => "ERR unknown".into(),
+    };
+    let _ = writeln!(w, "{resp}");
+}
+
+fn main() {
+    let cfg = load_config();
+    // ONE device handle behind a mutex. Concurrent opens/ioctls on the Uniwill EC
+    // interface corrupt reads (temps came back 0), so we serialise every access here.
+    let dev = match TuxedoIo::open() {
+        Ok(d) => Arc::new(Mutex::new(d)),
+        Err(e) => {
+            eprintln!("open /dev/tuxedo_io: {e}");
+            std::process::exit(1);
+        }
+    };
+    {
+        let d = dev.lock().unwrap();
+        if !d.is_uniwill().unwrap_or(false) {
+            eprintln!("not Uniwill, refusing");
+            std::process::exit(1);
+        }
+        eprintln!(
+            "tuxedo-controld: tuxedo_io {}, poll {}s, hyst {}C",
+            d.version().unwrap_or_default(),
+            cfg.poll_seconds,
+            cfg.hysteresis_c
+        );
+    }
+
+    let shared = Arc::new(Mutex::new(Shared::default()));
+    // Discover keyboard backlight + charging support first (apply_profile uses them).
+    if let Some(dir) = kbd_find() {
+        let max = kbd_read(&dir, "max_brightness");
+        eprintln!("keyboard backlight at {dir} (max {max})");
+        let mut s = shared.lock().unwrap();
+        s.kbd_dir = Some(dir);
+        s.kbd_max = max;
+    } else {
+        eprintln!("no keyboard backlight led found");
+    }
+    if chg_present() {
+        eprintln!("charging profiles: {} (current {})", chg_avail(), chg_get());
+        let mut s = shared.lock().unwrap();
+        s.charges = chg_avail();
+        s.charge = chg_get();
+    } else {
+        eprintln!("no charging-profile support");
+    }
+
+    // ---- Named profiles (TCC-style). The active profile drives perf/fan/kbd/charge. ----
+    let fresh = !std::path::Path::new(profiles::STORE_PATH).exists();
+    let store = {
+        let mut s = profiles::load();
+        // First run: fold the declarative config (curve/perf/kbd/charge) into a "Configured"
+        // profile and make it active, so an existing NixOS config keeps working as a profile.
+        if fresh && cfg.perf_profile.is_some() {
+            let p = Profile {
+                name: "Configured".into(),
+                perf: cfg.perf_profile.clone().unwrap(),
+                curve: cfg.curve.clone(),
+                kbd: cfg.kbd_brightness,
+                charge: cfg.charge_profile.clone(),
+            };
+            s.profiles.insert(0, p);
+            s.active = "Configured".into();
+            s.default = "Configured".into();
+            let _ = profiles::save(&s);
+        }
+        Arc::new(Mutex::new(s))
+    };
+    // Honour a configured active profile name (e.g. the module's defaultProfile).
+    if let Some(ref name) = cfg.profile {
+        let mut s = store.lock().unwrap();
+        if s.get(name).is_some() && s.active != *name {
+            s.active = name.clone();
+            let _ = profiles::save(&s);
+        }
+    }
+    {
+        let active = store.lock().unwrap().active_profile().cloned();
+        match active {
+            Some(p) => {
+                eprintln!("active profile: {} (perf {})", p.name, p.perf);
+                apply_profile(&dev, &shared, &p);
+            }
+            None => eprintln!("no active profile"),
+        }
+    }
+
+    // Socket server: shares the one device handle (locks it only for PROFILE).
+    {
+        let _ = std::fs::remove_file(SOCK_PATH);
+        match UnixListener::bind(SOCK_PATH) {
+            Ok(listener) => {
+                // World-accessible so the user's GUI can connect (local single-user laptop).
+                let _ = std::fs::set_permissions(
+                    SOCK_PATH,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o666),
+                );
+                let (sh, dv, st) = (shared.clone(), dev.clone(), store.clone());
+                std::thread::spawn(move || {
+                    for stream in listener.incoming().flatten() {
+                        handle_client(stream, &dv, &sh, &st);
+                    }
+                });
+                eprintln!("control socket at {SOCK_PATH}");
+            }
+            Err(e) => {
+                eprintln!("socket bind failed ({e}); GUI control unavailable, fan loop continues")
+            }
+        }
+    }
+
+    let term = Arc::new(AtomicBool::new(false));
+    install_signals(term.clone());
+
+    let mut commanded: i32 = -1;
+    while !term.load(Ordering::Relaxed) {
+        // Hold the device lock for the whole tick's ioctls (reads + fan write), then release.
+        let (ct, gt, cpu_fan, gpu_fan, mode);
+        let curve_target;
+        // The active profile's fan curve (falls back to the config curve if none).
+        let curve = store
+            .lock()
+            .unwrap()
+            .active_profile()
+            .map(|p| p.curve.clone())
+            .unwrap_or_else(|| cfg.curve.clone());
+        {
+            let d = dev.lock().unwrap();
+            ct = d.cpu_temp().unwrap_or(0);
+            gt = d.gpu_temp().unwrap_or(0);
+            let temp = ct.max(gt);
+            let up = interp(&curve, temp);
+            curve_target = if up >= commanded.max(0) {
+                up
+            } else {
+                interp(&curve, temp + cfg.hysteresis_c).min(commanded.max(0))
+            };
+
+            let manual = shared.lock().unwrap().manual;
+            // Safety net: never let the fan sit below the safety floor for the current temp,
+            // whatever the curve or a manual override asks for.
+            let target = manual
+                .unwrap_or(curve_target)
+                .max(profiles::safety_floor(temp));
+            if d.set_fan_pct(target).is_ok() && target != commanded {
+                eprintln!(
+                    "temp {temp}C -> fan {target}%{}",
+                    if manual.is_some() { " (manual)" } else { "" }
+                );
+            }
+            commanded = target;
+            cpu_fan = d.cpu_fan_pct().unwrap_or(0);
+            gpu_fan = d.gpu_fan_pct().unwrap_or(0);
+            mode = d.mode().unwrap_or(0);
+        }
+        // Cache the slow EC/sysfs reads here (on the loop) so STATUS stays instant.
+        let kbd_cur = {
+            let s = shared.lock().unwrap();
+            s.kbd_dir
+                .as_deref()
+                .map(|d| kbd_read(d, "brightness"))
+                .unwrap_or(-1)
+        };
+        let charge = if chg_present() {
+            chg_get()
+        } else {
+            String::new()
+        };
+        {
+            let mut s = shared.lock().unwrap();
+            s.cpu_temp = ct;
+            s.gpu_temp = gt;
+            s.cpu_fan = cpu_fan;
+            s.gpu_fan = gpu_fan;
+            s.mode = mode;
+            s.curve_pct = curve_target;
+            s.kbd_cur = kbd_cur;
+            s.charge = charge;
+        }
+        std::thread::sleep(Duration::from_secs(cfg.poll_seconds));
+    }
+
+    eprintln!("shutting down, restoring EC auto fan");
+    let _ = dev.lock().unwrap().restore_auto();
+    let _ = std::fs::remove_file(SOCK_PATH);
+}
+
+static TERM: AtomicBool = AtomicBool::new(false);
+extern "C" fn on_sig(_: libc::c_int) {
+    TERM.store(true, Ordering::Relaxed);
+}
+fn install_signals(term: Arc<AtomicBool>) {
+    unsafe {
+        let h = on_sig as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        libc::signal(libc::SIGTERM, h);
+        libc::signal(libc::SIGINT, h);
+    }
+    std::thread::spawn(move || loop {
+        if TERM.load(Ordering::Relaxed) {
+            term.store(true, Ordering::Relaxed);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    });
+}

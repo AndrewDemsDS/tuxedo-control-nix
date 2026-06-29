@@ -1,0 +1,60 @@
+name: Bug report
+description: Wrong fan behaviour, daemon error, or build/module problem.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security/safety issues (the daemon can be made to leave the fan off under load,
+        or a privilege escalation) must NOT be filed here. See SECURITY.md.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight
+      options:
+        - label: I searched existing issues and this isn't a duplicate.
+          required: true
+        - label: I disabled other fan controllers (tailord/tccd) before testing.
+          required: true
+        - label: This is NOT a security or physical-safety issue.
+          required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What did you observe, and what did you expect?
+    validations: { required: true }
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+    validations: { required: true }
+  - type: input
+    id: machine
+    attributes:
+      label: Laptop model
+      description: "sudo dmidecode -s system-product-name"
+    validations: { required: true }
+  - type: input
+    id: board
+    attributes:
+      label: Board name
+      description: "sudo dmidecode -s baseboard-product-name"
+    validations: { required: true }
+  - type: input
+    id: tio
+    attributes:
+      label: tuxedo_io version
+      description: "tuxedo-prober info, or modinfo tuxedo_io | grep version"
+    validations: { required: true }
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel + OS
+    validations: { required: true }
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      render: shell

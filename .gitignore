@@ -1,0 +1,20 @@
+/target
+result
+result-*
+*.swp
+.direnv/
+
+# AI assistant tooling: never commit these to the repo.
+CLAUDE.md
+GEMINI.md
+AGENTS.md
+.claude/
+.claude.json
+.cursor/
+.cursorrules
+.cursorignore
+.aider*
+.continue/
+.codeium/
+.windsurf/
+.github/copilot-instructions.md
