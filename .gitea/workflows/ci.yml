@@ -21,7 +21,8 @@ jobs:
             experimental-features = nix-command flakes
             accept-flake-config = true
       # --no-build: evaluate flake outputs + the NixOS module without sandbox-building
-      # derivations (the act_runner container can't sandbox).
+      # derivations (the act_runner container can't sandbox). This still evaluates the VM
+      # boot test (checks.vm-test); GitHub Actions actually builds and runs it.
       - run: nix flake check --no-build
 
   cargo:

@@ -33,7 +33,8 @@
         checks = {
           build = self.packages.${system}.default;
           # Cheap end-to-end module eval: forcing ExecStart evaluates the whole module;
-          # a broken option/type/assertion fails the check without a VM build.
+          # a broken option/type/assertion fails this without booting a VM, so it stays
+          # fast and runs everywhere (including the sandbox-less Gitea runner via --no-build).
           module-eval = pkgs.runCommand "module-eval"
             {
               execStart = (nixpkgs.lib.nixosSystem {
@@ -49,6 +50,14 @@
                 ];
               }).config.systemd.services.tuxedo-control.serviceConfig.ExecStart;
             } ''printf '%s\n' "$execStart" > $out'';
+        }
+        # Full boot test (Linux only; needs KVM, so it runs on the GitHub runner — the
+        # Gitea runner is --no-build and only evaluates it). Brings up a VM with the module
+        # enabled and asserts the unit wiring, that tuxedo-rs/tailord is disabled, that the
+        # declarative options reach config.json, and that the daemon fails gracefully
+        # without hardware.
+        // nixpkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          vm-test = import ./nix/vm-test.nix { inherit pkgs nixosModule; };
         };
 
         devShells.default = pkgs.mkShell {

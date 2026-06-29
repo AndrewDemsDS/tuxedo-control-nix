@@ -12,6 +12,9 @@ may change in any `0.y` release. See "Versioning" in the README.
 ### Added
 - Module options `keyboard.backlight.brightness` and `charging.profile`, re-asserted by
   the daemon on every start (declarative keyboard backlight and battery charging profile).
+- NixOS VM test (`checks.vm-test`): boots a VM with the module enabled and asserts the unit
+  wiring, that tuxedo-rs/tailord is disabled, that the declarative options reach the daemon
+  config, and that the daemon fails gracefully without hardware. Runs in GitHub CI.
 
 ## [0.1.0] - 2026-06-27
 

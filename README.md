@@ -100,7 +100,6 @@ services.tuxedo-control = {
 ## Roadmap (next)
 
 - Generalise beyond Uniwill-AMD Gen9 (model gating via `R_UW_MODEL_ID`).
-- A VM-based NixOS test in CI (lint/build CI already runs on every push).
 
 ## Methodology (source-first, no black-box guessing)
 
