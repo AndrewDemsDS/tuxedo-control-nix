@@ -10,7 +10,7 @@ use gtk::cairo;
 
 const T_MAX: f64 = 100.0; // temperature axis °C
 const D_MAX: f64 = 100.0; // duty axis %
-const PAD: f64 = 36.0; // plot padding (axis labels)
+const PAD: f64 = 44.0; // plot padding (room for the °C / % axis labels)
 const HIT: f64 = 14.0; // px radius to grab/remove a point
 
 type Curve = Rc<RefCell<Vec<(i32, i32)>>>;
@@ -101,7 +101,7 @@ pub fn open(
     // ---- draw ----
     {
         let pts = pts.clone();
-        area.set_draw_func(move |_a, cr: &cairo::Context, w, h| {
+        area.set_draw_func(move |da, cr: &cairo::Context, w, h| {
             let (w, h) = (w as f64, h as f64);
             cr.set_source_rgba(0.5, 0.5, 0.5, 0.25);
             cr.set_line_width(1.0);
@@ -148,6 +148,28 @@ pub fn open(
                 let (x, y) = to_px(w, h, t as f64, d as f64);
                 cr.arc(x, y, 5.0, 0.0, std::f64::consts::TAU);
                 let _ = cr.fill();
+            }
+            // axis tick labels, with units: temperature (°C) on X, fan duty (%) on Y.
+            // Use the widget's foreground colour so labels stay legible in light and dark.
+            let col = da.color();
+            cr.set_source_rgba(col.red() as f64, col.green() as f64, col.blue() as f64, 0.7);
+            cr.set_font_size(11.0);
+            for i in (0..=10).step_by(2) {
+                let frac = i as f64 / 10.0;
+                // X axis: temperature, centred under each gridline.
+                let xlabel = format!("{}°C", (frac * T_MAX) as i32);
+                let gx = PAD + frac * (w - 2.0 * PAD);
+                if let Ok(ext) = cr.text_extents(&xlabel) {
+                    cr.move_to(gx - ext.width() / 2.0, h - PAD + 18.0);
+                    let _ = cr.show_text(&xlabel);
+                }
+                // Y axis: fan duty, right-aligned just left of the plot.
+                let ylabel = format!("{}%", (frac * D_MAX) as i32);
+                let gy = (h - PAD) - frac * (h - 2.0 * PAD);
+                if let Ok(ext) = cr.text_extents(&ylabel) {
+                    cr.move_to(PAD - 8.0 - ext.width(), gy + ext.height() / 2.0);
+                    let _ = cr.show_text(&ylabel);
+                }
             }
         });
     }
