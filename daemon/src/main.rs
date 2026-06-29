@@ -434,6 +434,23 @@ fn main() {
         }
     }
 
+    // Declarative peripheral state: re-assert the configured keyboard backlight / charging
+    // profile on every startup, independent of the named-profile store (which only carries
+    // these when a "Configured" profile was seeded on first run). This makes the module's
+    // keyboard.backlight / charging options take effect on each boot, not just a fresh store.
+    if let Some(b) = cfg.kbd_brightness {
+        let dir = shared.lock().unwrap().kbd_dir.clone();
+        if let Some(d) = dir {
+            let _ = kbd_write(&d, b);
+            shared.lock().unwrap().kbd_cur = b;
+        }
+    }
+    if let Some(ref c) = cfg.charge_profile {
+        if chg_present() && chg_set(c).is_ok() {
+            shared.lock().unwrap().charge = c.clone();
+        }
+    }
+
     // Socket server: shares the one device handle (locks it only for PROFILE).
     {
         let _ = std::fs::remove_file(SOCK_PATH);

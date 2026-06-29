@@ -8,6 +8,8 @@
 #     enable = true;
 #     performanceProfile = "power_save";
 #     fan.curve = [ { temp = 25; speed = 0; } { temp = 60; speed = 30; } { temp = 90; speed = 100; } ];
+#     keyboard.backlight.brightness = 2;   # 0..max_brightness (0–4 on the reference board)
+#     charging.profile = "stationary";     # stationary | balanced | high_capacity
 #   };
 self: { config, lib, pkgs, ... }:
 let
@@ -22,6 +24,8 @@ let
     # otherwise the daemon uses its built-in profiles and selects `defaultProfile`.
     // lib.optionalAttrs (cfg.performanceProfile != null) { perf_profile = cfg.performanceProfile; }
     // lib.optionalAttrs (cfg.fan.curve != [ ]) { curve = map (p: [ p.temp p.speed ]) cfg.fan.curve; }
+    // lib.optionalAttrs (cfg.keyboard.backlight.brightness != null) { kbd_brightness = cfg.keyboard.backlight.brightness; }
+    // lib.optionalAttrs (cfg.charging.profile != null) { charge_profile = cfg.charging.profile; }
   );
   configFile = pkgs.writeText "tuxedo-control.json" json;
 in
@@ -83,6 +87,32 @@ in
         Optional ascending (temp °C → fan duty %) points for the "Configured" profile. Empty
         uses the built-in profiles. Note the driver enforces a ~25% on-speed floor; duties
         below ~12% become 0 (fan off).
+      '';
+    };
+
+    keyboard.backlight.brightness = lib.mkOption {
+      # Bounded (not just unsigned) so a typo fails at eval time rather than overflowing the
+      # daemon's i32 config field, which would make the whole config parse fall back to defaults.
+      type = lib.types.nullOr (lib.types.ints.between 0 255);
+      default = null;
+      example = 2;
+      description = ''
+        Optional keyboard-backlight brightness level, re-asserted on each daemon start.
+        The range is hardware-defined (0 = off up to the LED's `max_brightness`; the
+        reference board exposes 0–4). Values above the maximum are clamped by the driver.
+        Leave `null` to not manage the backlight. Applies only if the laptop has a
+        controllable backlight LED.
+      '';
+    };
+
+    charging.profile = lib.mkOption {
+      type = lib.types.nullOr (lib.types.enum [ "stationary" "balanced" "high_capacity" ]);
+      default = null;
+      example = "stationary";
+      description = ''
+        Optional battery charging profile, re-asserted on each daemon start:
+        "stationary" (~60% cap), "balanced" (~80%), or "high_capacity" (100%). Leave
+        `null` to not manage charging. Applies only if the EC exposes charging profiles.
       '';
     };
   };

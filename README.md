@@ -37,9 +37,9 @@ Electron, no guessing.
 services.tuxedo-control = {
   enable = true;
   fan.curve = [ { temp = 25; speed = 0; } { temp = 50; speed = 0; } /* … */ ];
-  performanceProfile = "power_save";   # decoupled from the fan curve
-  chargeLimit = 80;
-  keyboard.backlight = { color = "#ffaa00"; brightness = 40; };
+  performanceProfile = "power_save";        # decoupled from the fan curve
+  charging.profile = "stationary";          # stationary | balanced | high_capacity
+  keyboard.backlight.brightness = 2;        # 0..max_brightness (0–4 on the reference board)
 };
 ```
 
@@ -99,7 +99,6 @@ services.tuxedo-control = {
 
 ## Roadmap (next)
 
-- Charge-limit + keyboard-backlight options on the NixOS module (the GUI already drives them).
 - Generalise beyond Uniwill-AMD Gen9 (model gating via `R_UW_MODEL_ID`).
 - A VM-based NixOS test in CI (lint/build CI already runs on every push).
 

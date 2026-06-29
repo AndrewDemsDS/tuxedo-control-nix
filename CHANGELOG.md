@@ -9,6 +9,10 @@ may change in any `0.y` release. See "Versioning" in the README.
 
 ## [Unreleased]
 
+### Added
+- Module options `keyboard.backlight.brightness` and `charging.profile`, re-asserted by
+  the daemon on every start (declarative keyboard backlight and battery charging profile).
+
 ## [0.1.0] - 2026-06-27
 
 ### Added
