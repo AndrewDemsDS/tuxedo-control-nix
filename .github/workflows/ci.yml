@@ -52,4 +52,6 @@ jobs:
       # (needed by the gui crate) are present.
       - run: nix develop --command cargo fmt --all --check
       - run: nix develop --command cargo clippy --workspace --all-targets -- -D warnings
+      # Includes the simulated-tuxedo_io model-matrix suite (tuxedoio::sim): per-model
+      # write-gating, fan scaling, perf enforcement, caps + daemon fan-curve/sysfs unit tests.
       - run: nix develop --command cargo test --workspace

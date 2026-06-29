@@ -141,16 +141,21 @@ fn kbd_write(dir: &str, v: i32) -> std::io::Result<()> {
 
 // ---- Battery charging profile (sysfs; stationary / balanced / high_capacity) ----
 const CHG_DIR: &str = "/sys/devices/platform/tuxedo_keyboard/charging_profile";
+/// The charging-profile sysfs dir. Overridable via `TUXEDO_CHG_DIR` so tests can point it at a
+/// tempdir; production always uses the default. (Set it before any chg_* call in a test.)
+fn chg_dir() -> String {
+    std::env::var("TUXEDO_CHG_DIR").unwrap_or_else(|_| CHG_DIR.to_string())
+}
 fn chg_present() -> bool {
-    std::path::Path::new(&format!("{CHG_DIR}/charging_profile")).exists()
+    std::path::Path::new(&format!("{}/charging_profile", chg_dir())).exists()
 }
 fn chg_get() -> String {
-    std::fs::read_to_string(format!("{CHG_DIR}/charging_profile"))
+    std::fs::read_to_string(format!("{}/charging_profile", chg_dir()))
         .map(|s| s.trim().to_string())
         .unwrap_or_default()
 }
 fn chg_avail() -> String {
-    std::fs::read_to_string(format!("{CHG_DIR}/charging_profiles_available"))
+    std::fs::read_to_string(format!("{}/charging_profiles_available", chg_dir()))
         .map(|s| s.trim().to_string())
         .unwrap_or_default()
 }
@@ -161,7 +166,7 @@ fn chg_set(v: &str) -> std::io::Result<()> {
             "bad profile",
         ));
     }
-    std::fs::write(format!("{CHG_DIR}/charging_profile"), v)
+    std::fs::write(format!("{}/charging_profile", chg_dir()), v)
 }
 
 fn interp(curve: &[(i32, i32)], temp: i32) -> i32 {
@@ -620,4 +625,126 @@ fn install_signals(term: Arc<AtomicBool>) {
         }
         std::thread::sleep(Duration::from_millis(200));
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A unique temp dir for one test fn (process id keeps it unique across concurrent
+    /// `cargo test` runs; the `tag` keeps each test fn's dir distinct within a run).
+    fn unique_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tuxedo-test-{}-{}", tag, std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // ---- interp (fan-curve interpolation) ----
+
+    #[test]
+    fn interp_empty_is_zero() {
+        assert_eq!(interp(&[], 50), 0);
+    }
+
+    #[test]
+    fn interp_clamps_below_first_and_above_last() {
+        let curve = [(40, 10), (80, 100)];
+        // below first point -> first duty
+        assert_eq!(interp(&curve, 0), 10);
+        assert_eq!(interp(&curve, 40), 10);
+        // above last point -> last duty
+        assert_eq!(interp(&curve, 200), 100);
+        assert_eq!(interp(&curve, 80), 100);
+    }
+
+    #[test]
+    fn interp_exact_points_return_their_duty() {
+        let curve = [(40, 0), (60, 50), (80, 100)];
+        assert_eq!(interp(&curve, 40), 0);
+        assert_eq!(interp(&curve, 60), 50);
+        assert_eq!(interp(&curve, 80), 100);
+    }
+
+    #[test]
+    fn interp_linear_midpoints() {
+        let curve = [(40, 0), (80, 100)];
+        assert_eq!(interp(&curve, 60), 50);
+        assert_eq!(interp(&curve, 50), 25);
+    }
+
+    #[test]
+    fn interp_flat_segment_does_not_panic() {
+        // Two points at the same temp: the t1 == t0 branch must not divide by zero.
+        let curve = [(40, 0), (60, 20), (60, 50), (80, 100)];
+        assert_eq!(interp(&curve, 60), 20);
+        // surrounding interpolation still works
+        assert_eq!(interp(&curve, 50), 10);
+    }
+
+    // ---- safety_floor thresholds ----
+
+    #[test]
+    fn safety_floor_thresholds() {
+        assert_eq!(profiles::safety_floor(74), 0);
+        assert_eq!(profiles::safety_floor(0), 0);
+        assert_eq!(profiles::safety_floor(75), 30);
+        assert_eq!(profiles::safety_floor(80), 45);
+        assert_eq!(profiles::safety_floor(85), 60);
+        assert_eq!(profiles::safety_floor(90), 80);
+        assert_eq!(profiles::safety_floor(95), 80);
+    }
+
+    // ---- charge profile sysfs ----
+    // ALL charge file-IO lives in this ONE test: chg_dir() reads TUXEDO_CHG_DIR, which is
+    // process-global, and cargo runs tests in parallel threads. A second test touching the
+    // env var would race this one.
+    #[test]
+    fn charge_set_get_present() {
+        let dir = std::env::temp_dir().join(format!("tuxedo-test-chg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("TUXEDO_CHG_DIR", &dir);
+
+        // Validation rejects unknown profiles BEFORE any file write.
+        let err = chg_set("garbage").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        // A valid profile writes {dir}/charging_profile and round-trips.
+        chg_set("stationary").unwrap();
+        assert_eq!(chg_get(), "stationary");
+        assert!(chg_present());
+
+        chg_set("balanced").unwrap();
+        assert_eq!(chg_get(), "balanced");
+
+        std::env::remove_var("TUXEDO_CHG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- keyboard backlight sysfs (dir param: no env, no races) ----
+
+    #[test]
+    fn kbd_write_then_read_roundtrip() {
+        let dir = unique_dir("kbd-roundtrip");
+        let d = dir.to_str().unwrap();
+        kbd_write(d, 3).unwrap();
+        assert_eq!(kbd_read(d, "brightness"), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kbd_write_clamps_negative_to_zero() {
+        let dir = unique_dir("kbd-clamp");
+        let d = dir.to_str().unwrap();
+        kbd_write(d, -5).unwrap();
+        assert_eq!(kbd_read(d, "brightness"), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kbd_read_missing_attr_is_minus_one() {
+        let dir = unique_dir("kbd-missing");
+        let d = dir.to_str().unwrap();
+        assert_eq!(kbd_read(d, "max_brightness"), -1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

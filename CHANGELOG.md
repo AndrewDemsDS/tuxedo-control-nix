@@ -15,6 +15,11 @@ may change in any `0.y` release. See "Versioning" in the README.
   registry (`TuxedoIo::open`), so an unvalidated board runs read-only; the prober uses
   `TuxedoIo::open_unchecked` to validate new boards. The daemon logs the gating decision and
   surfaces `model_id` + `read_only` in its `STATUS` reply. See `docs/model-gating.md`.
+- Simulated `tuxedo_io` EC test harness (`tuxedoio::sim`) with a per-model fixture table, plus a
+  model-matrix test suite run in CI (`cargo test --workspace`). For each board it verifies the
+  write-gate (only validated models are writable), fan-duty scaling, the `0x40` fan-ownership
+  fix, performance-profile enforcement, and capability probes — with daemon unit tests for the
+  fan-curve interpolation, safety floor, charging-profile, and keyboard-backlight logic.
 
 ## [0.2.0] - 2026-06-29
 

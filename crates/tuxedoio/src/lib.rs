@@ -122,8 +122,56 @@ pub fn raw_to_pct(r: i32) -> i32 {
     (r * 100 + FAN_MAX / 2) / FAN_MAX
 }
 
-pub struct TuxedoIo {
+/// Raw ioctl backend for a [`TuxedoIo`]. The real implementation talks to `/dev/tuxedo_io`;
+/// tests substitute a simulated EC (see [`sim`]). The write-gate is intentionally NOT here —
+/// it lives in `TuxedoIo::wr`/`noarg`, so the safety property holds for any backend.
+pub trait EcBackend: Send {
+    fn rd(&self, req: libc::c_ulong) -> io::Result<i32>;
+    fn wr(&self, req: libc::c_ulong, v: i32) -> io::Result<()>;
+    fn noarg(&self, req: libc::c_ulong) -> io::Result<()>;
+    fn version(&self) -> io::Result<String>;
+}
+
+/// The real backend: ioctls on an open `/dev/tuxedo_io` handle.
+struct DeviceBackend {
     file: std::fs::File,
+}
+impl EcBackend for DeviceBackend {
+    fn rd(&self, req: libc::c_ulong) -> io::Result<i32> {
+        let mut v: i32 = 0;
+        let r = unsafe { libc::ioctl(self.file.as_raw_fd(), req, &mut v as *mut i32) };
+        if r < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(v)
+    }
+    fn wr(&self, req: libc::c_ulong, mut v: i32) -> io::Result<()> {
+        let r = unsafe { libc::ioctl(self.file.as_raw_fd(), req, &mut v as *mut i32) };
+        if r < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    fn noarg(&self, req: libc::c_ulong) -> io::Result<()> {
+        let r = unsafe { libc::ioctl(self.file.as_raw_fd(), req) };
+        if r < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    fn version(&self) -> io::Result<String> {
+        let mut buf = [0u8; 64];
+        let r = unsafe { libc::ioctl(self.file.as_raw_fd(), R_MOD_VERSION, buf.as_mut_ptr()) };
+        if r < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        Ok(String::from_utf8_lossy(&buf[..end]).into_owned())
+    }
+}
+
+pub struct TuxedoIo {
+    backend: Box<dyn EcBackend>,
     /// Writes (fan duty, perf, mode, fan-auto) are refused unless the board is validated.
     /// This is the safety gate: every EC-writing consumer (daemon, TUI) inherits it.
     write_allowed: bool,
@@ -135,25 +183,48 @@ impl TuxedoIo {
     /// behaviour is unknown). Use [`TuxedoIo::open_unchecked`] for the prober, which must be
     /// able to write in order to validate a new board.
     pub fn open() -> io::Result<Self> {
-        let mut me = Self::open_unchecked()?;
-        // Best-effort: if the model id can't be read, stay locked (fail safe to read-only).
-        me.write_allowed = me
-            .model_id()
-            .map(|id| known_model(id).is_some())
-            .unwrap_or(false);
-        Ok(me)
+        Ok(Self::from_backend(Box::new(DeviceBackend {
+            file: OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/tuxedo_io")?,
+        })))
     }
 
     /// Open WITHOUT the model write-gate. Reserved for the prober's source-first validation
     /// of a new board (reads first, then writes with `auto` as the bail-out).
     pub fn open_unchecked() -> io::Result<Self> {
-        Ok(Self {
+        Ok(Self::from_backend_unchecked(Box::new(DeviceBackend {
             file: OpenOptions::new()
                 .read(true)
                 .write(true)
                 .open("/dev/tuxedo_io")?,
+        })))
+    }
+
+    /// Wrap any backend, applying the model write-gate: reads the model id and allows writes
+    /// only if it is in [`KNOWN_MODELS`], else read-only. `pub(crate)` so only the in-crate
+    /// [`sim`] harness can substitute a backend; external callers use [`TuxedoIo::open`].
+    pub(crate) fn from_backend(backend: Box<dyn EcBackend>) -> Self {
+        let mut me = Self {
+            backend,
+            write_allowed: false,
+        };
+        // Best-effort: if the model id can't be read, stay locked (fail safe to read-only).
+        me.write_allowed = me
+            .model_id()
+            .map(|id| known_model(id).is_some())
+            .unwrap_or(false);
+        me
+    }
+
+    /// Wrap any backend WITHOUT the model write-gate. `pub(crate)`: keeps the ungated
+    /// constructor off the public API (the real ungated path is [`TuxedoIo::open_unchecked`]).
+    pub(crate) fn from_backend_unchecked(backend: Box<dyn EcBackend>) -> Self {
+        Self {
+            backend,
             write_allowed: true,
-        })
+        }
     }
 
     /// Whether EC writes are permitted (i.e. the board is in [`KNOWN_MODELS`]).
@@ -162,25 +233,16 @@ impl TuxedoIo {
     }
 
     pub fn rd(&self, req: libc::c_ulong) -> io::Result<i32> {
-        let mut v: i32 = 0;
-        let r = unsafe { libc::ioctl(self.file.as_raw_fd(), req, &mut v as *mut i32) };
-        if r < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(v)
+        self.backend.rd(req)
     }
-    pub fn wr(&self, req: libc::c_ulong, mut v: i32) -> io::Result<()> {
+    pub fn wr(&self, req: libc::c_ulong, v: i32) -> io::Result<()> {
         if !self.write_allowed {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "EC writes disabled: unvalidated board model",
             ));
         }
-        let r = unsafe { libc::ioctl(self.file.as_raw_fd(), req, &mut v as *mut i32) };
-        if r < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        self.backend.wr(req, v)
     }
     pub fn noarg(&self, req: libc::c_ulong) -> io::Result<()> {
         if !self.write_allowed {
@@ -189,11 +251,7 @@ impl TuxedoIo {
                 "EC writes disabled: unvalidated board model",
             ));
         }
-        let r = unsafe { libc::ioctl(self.file.as_raw_fd(), req) };
-        if r < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        self.backend.noarg(req)
     }
 
     pub fn is_uniwill(&self) -> io::Result<bool> {
@@ -272,12 +330,8 @@ impl TuxedoIo {
     }
 
     pub fn version(&self) -> io::Result<String> {
-        let mut buf = [0u8; 64];
-        let r = unsafe { libc::ioctl(self.file.as_raw_fd(), R_MOD_VERSION, buf.as_mut_ptr()) };
-        if r < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-        Ok(String::from_utf8_lossy(&buf[..end]).into_owned())
+        self.backend.version()
     }
 }
+
+pub mod sim;
