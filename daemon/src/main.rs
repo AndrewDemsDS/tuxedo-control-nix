@@ -22,6 +22,12 @@ mod profiles;
 use profiles::{Profile, Store};
 
 const SOCK_PATH: &str = "/run/tuxedo-control.sock";
+/// EMA window for temperature smoothing (anti fan-hunting): the curve reads an averaged temp
+/// instead of the noisy instantaneous sensor. Higher = smoother but slower to react.
+const TEMP_SMOOTH_N: i32 = 3;
+/// Deadband: don't rewrite fan duty for curve-driven changes smaller than this many percent.
+/// Stops the fan oscillating on small temperature wobble; the safety floor still overrides it.
+const FAN_DEADBAND_PCT: i32 = 3;
 
 /// Apply a profile's perf mode + (optional) keyboard backlight + charge profile.
 /// The control loop reads the fan curve live from the active profile.
@@ -535,6 +541,7 @@ fn main() {
     install_signals(term.clone());
 
     let mut commanded: i32 = -1;
+    let mut smoothed_temp: i32 = -1; // EMA state; <0 = unseeded (first tick)
     while !term.load(Ordering::Relaxed) {
         // Hold the device lock for the whole tick's ioctls (reads + fan write), then release.
         let (ct, gt, cpu_fan, gpu_fan, mode);
@@ -550,7 +557,15 @@ fn main() {
             let d = dev.lock().unwrap();
             ct = d.cpu_temp().unwrap_or(0);
             gt = d.gpu_temp().unwrap_or(0);
-            let temp = ct.max(gt);
+            let temp_raw = ct.max(gt);
+            // EMA-smooth the temperature so the fan follows the trend, not every sensor spike.
+            // This is the main fix for audible up/down fan hunting. First tick seeds directly.
+            smoothed_temp = if smoothed_temp < 0 {
+                temp_raw
+            } else {
+                (smoothed_temp * (TEMP_SMOOTH_N - 1) + temp_raw) / TEMP_SMOOTH_N
+            };
+            let temp = smoothed_temp;
             let up = interp(&curve, temp);
             curve_target = if up >= commanded.max(0) {
                 up
@@ -559,15 +574,22 @@ fn main() {
             };
 
             let manual = shared.lock().unwrap().manual;
-            // Safety net: never let the fan sit below the safety floor for the current temp,
-            // whatever the curve or a manual override asks for.
-            let target = manual
-                .unwrap_or(curve_target)
-                .max(profiles::safety_floor(temp));
+            let desired = manual.unwrap_or(curve_target);
+            // Deadband: hold the current duty for small curve-driven changes so the fan stops
+            // oscillating on minor temperature wobble. A manual override applies exactly.
+            let prev = commanded.max(0);
+            let held = if manual.is_some() || (desired - prev).abs() >= FAN_DEADBAND_PCT {
+                desired
+            } else {
+                prev
+            };
+            // Safety net on the RAW temperature (immediate response to real heat, regardless of
+            // smoothing/deadband): never sit below the safety floor for the current temp.
+            let target = held.max(profiles::safety_floor(temp_raw));
             // Read-only on unsupported boards: report the curve target but never drive the EC.
             if !read_only && d.set_fan_pct(target).is_ok() && target != commanded {
                 eprintln!(
-                    "temp {temp}C -> fan {target}%{}",
+                    "temp {temp_raw}C (avg {temp}C) -> fan {target}%{}",
                     if manual.is_some() { " (manual)" } else { "" }
                 );
             }

@@ -23,6 +23,14 @@ may change in any `0.y` release. See "Versioning" in the README.
   presence-gating + enum validation and keyboard-backlight discovery + per-model
   `max_brightness`; plus unit tests for fan-curve interpolation and the safety floor.
 
+### Fixed
+- Fan-duty oscillation ("hunting"): the control loop read the instantaneous temperature each
+  tick and rewrote the fan duty on every 1 °C of sensor noise, so the fan audibly ramped up and
+  down. It now EMA-smooths the temperature (curve follows the trend, not spikes) and applies a
+  duty deadband (small changes hold the current duty), so the fan settles and stays steady. The
+  safety floor still uses the raw temperature, so real heat gets an immediate response. Measured:
+  on the reference board the fan went from a change every few seconds to one change in 70 s at idle.
+
 ## [0.2.0] - 2026-06-29
 
 ### Added
